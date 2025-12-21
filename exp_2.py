@@ -1,7 +1,7 @@
 """
-Docstring for res_2
+Docstring for exp_2
 
-Command: python3 res_2.py --kml demo_survey_area_new.kml --speed 5.0
+Command: python3 exp_2.py --kml demo_survey_area_new.kml --speed 5.0
 
 
 """
