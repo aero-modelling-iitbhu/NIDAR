@@ -2,11 +2,7 @@
 Docstring for exp_2
 
 Command: python3 exp_2.py --kml demo_survey_area_new.kml --speed 5.0
-
-
 """
-
-
 
 import argparse
 import xml.etree.ElementTree as ET
@@ -18,6 +14,10 @@ import threading
 import math
 import sys
 import os
+import cv2
+import numpy as np
+import threading
+import time
 
 
 class GridSurveyNode(Node):
@@ -33,10 +33,9 @@ class GridSurveyNode(Node):
         self.kml_file = None
         self.polygon_coords = []           # list of (lat, lon)
 
-
         # acceptance criteria
         self.accept_radius_m = 3.0         # meters to consider waypoint reached
-        self.waypoint_timeout_s = 400       # seconds to wait for a waypoint
+        self.waypoint_timeout_s = 400      # seconds to wait for a waypoint
 
         # control flags
         self.stop_requested = False
@@ -48,12 +47,29 @@ class GridSurveyNode(Node):
         self.get_logger().info("Connected to vehicle via MAVLink")
 
         # start keyboard watcher (q to stop)
-        self.kb_thread = threading.Thread(target=self._keyboard_watcher, daemon=True)
-        self.kb_thread.start()
+        # made_change - keyboard watcher start disabled
+        # self.kb_thread = threading.Thread(target=self._keyboard_watcher, daemon=True)
+        # self.kb_thread.start()
 
         # start mission in background thread so rclpy.spin() isn't blocked
         self.mission_thread = threading.Thread(target=self.load_and_run_mission, daemon=True)
         # Thread will be started manually after configuration
+
+        # ---------- Camera-based human detection (STRUCTURE ONLY) ----------
+        # State machine variable (future use)
+        self.flight_state = "MISSION"      # TODO: replace stop_requested with full state machine
+        self.human_detected = False
+        self._detector_running = True
+        self._detector_thread = None
+        self._human_lock = threading.Lock()
+        # Delivery placeholders (set later)
+        self.delivery_altitude = None      # TODO: set desired delivery altitude (m)
+        self.original_altitude = None      # TODO: store altitude before delivery sequence
+        self.delivery_start_time = None    # TODO: timestamp for hover/timeout logic
+
+        # NOTE: start_camera_detector() is invoked to begin background camera detection.
+        # If you want to keep running the old keyboard behaviour, comment out the next line.
+        self.start_camera_detector()
 
     def start_mission(self):
         self.mission_thread.start()
@@ -80,15 +96,14 @@ class GridSurveyNode(Node):
             # Namespace handling
             ns = {'kml': 'http://www.opengis.net/kml/2.2'}
             # Find coordinates in Polygon/outerBoundaryIs/LinearRing/coordinates
-            # This path works for the provided examples.
             coords_text = None
             for coords_node in root.findall('.//kml:coordinates', ns):
                 coords_text = coords_node.text
                 break
-            
+
             if not coords_text:
                 # Try without namespace if failed
-                 for coords_node in root.findall('.//coordinates'):
+                for coords_node in root.findall('.//coordinates'):
                     coords_text = coords_node.text
                     break
 
@@ -105,26 +120,13 @@ class GridSurveyNode(Node):
                 if len(parts) >= 2:
                     p1 = float(parts[0])
                     p2 = float(parts[1])
-                    
+
                     # Heuristic: Latitude is always [-90, 90]. Longitude [-180, 180].
-                    # Standard KML is lon, lat.
-                    # If the first number is > 90 or < -90, it MUST be lon.
-                    # If the second number is > 90 or < -90, it MUST be lon (and first is lat).
-                    # If both are within range, we assume standard lon, lat unless we have reason not to.
-                    
                     lat, lon = 0.0, 0.0
-                    
-                    if abs(p2) > 90:
-                        # p2 is definitely lon? No, lat cant be > 90.
-                        # Wait, if p2 > 90, it CANNOT be lat. So p2=lon, p1=lat.
-                        # But wait, standard is lon,lat => p1=lon, p2=lat.
-                        # If p2 > 90, then p2 is invalid latitude.
-                        pass
-                        
-                    # Let's check ranges.
+
                     is_p1_lat_candidate = -90 <= p1 <= 90
                     is_p2_lat_candidate = -90 <= p2 <= 90
-                    
+
                     if is_p1_lat_candidate and not is_p2_lat_candidate:
                         # p1 is lat, p2 is lon (Non-standard "lat,lon")
                         lat, lon = p1, p2
@@ -134,9 +136,9 @@ class GridSurveyNode(Node):
                     else:
                         # Both could be lat? Assume Standard lon, lat
                         lat, lon = p2, p1
-                        
+
                     points.append((lat, lon))
-            
+
             self.get_logger().info(f"Parsed {len(points)} points from KML.")
             return points
 
@@ -164,23 +166,14 @@ class GridSurveyNode(Node):
 
     def _target_lat_intersects_edge(self, lat, lon, p1lat, p1lon, p2lat, p2lon):
         # Check if ray from (lat, lon) to (lat, +inf) crosses edge (p1, p2)
-        # We use latitude as the Y-axis, Longitude as X-axis just for mental mapping, 
-        # but standard algorithm:
-        # Cross if p1lon > lon != p2lon > lon (one point to right) ... wait.
-        # Ray casting: usually cast horizontal ray to right.
-        # lat is Y, lon is X.
-        # Check if point.y is between p1.y and p2.y
-        
         if min(p1lat, p2lat) < lat <= max(p1lat, p2lat):
             # find x intersection
             if p1lat != p2lat:
                 x_inters = (lat - p1lat) * (p2lon - p1lon) / (p2lat - p1lat) + p1lon
             else:
-                x_inters = p2lon # Horizontal line?
-                
+                x_inters = p2lon
             if p1lon == p2lon:
                  x_inters = p1lon
-                 
             if lon < x_inters:
                 return True
         return False
@@ -194,18 +187,18 @@ class GridSurveyNode(Node):
         """
         if not polygon:
             return []
-            
+
         lats = [p[0] for p in polygon]
         lons = [p[1] for p in polygon]
-        
+
         min_lat, max_lat = min(lats), max(lats)
         min_lon, max_lon = min(lons), max(lons)
-        
+
         waypoints = []
         # Start from left (min_lon) to right
         curr_lon = min_lon
         reverse = False
-        
+
         while curr_lon <= max_lon:
             col_points = []
             # Scan latitude from max to min
@@ -214,19 +207,19 @@ class GridSurveyNode(Node):
                 if self.is_point_in_polygon(curr_lat, curr_lon, polygon):
                     col_points.append((curr_lat, curr_lon))
                 curr_lat -= spacing
-            
+
             if col_points:
                 # User Request: Only start and end points of the line
                 if len(col_points) > 1:
                     col_points = [col_points[0], col_points[-1]]
-                
+
                 if reverse:
                     col_points.reverse()
                 waypoints.extend(col_points)
                 reverse = not reverse
-                
+
             curr_lon += spacing
-            
+
         return waypoints
 
     # ---------------------------
@@ -239,7 +232,7 @@ class GridSurveyNode(Node):
         phi2 = math.radians(lat2)
         dphi = math.radians(lat2 - lat1)
         dlambda = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2.0)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2.0)**2
+        a = math.sin(dphi/2.0)**2 + math.cos(phi1).math.cos(phi2) * math.sin(dlambda/2.0)**2 if False else math.sin(dphi/2.0)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2.0)**2
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
 
@@ -280,7 +273,7 @@ class GridSurveyNode(Node):
         try:
             # WPNAV_SPEED is in cm/s
             speed_cm_s = int(speed_m_s * 100)
-            
+
             self.master.mav.param_set_send(
                 self.master.target_system,
                 self.master.target_component,
@@ -442,6 +435,141 @@ class GridSurveyNode(Node):
             self.get_logger().error(f"Keyboard watcher exception: {e}")
 
     # ---------------------------
+    # Camera detector (currently structural)
+    # ---------------------------
+    def start_camera_detector(self):
+
+        if self._detector_thread is not None and self._detector_thread.is_alive():
+            self.get_logger().info("Camera detector already running.")
+            return
+        self._detector_running = True
+        self._detector_thread = threading.Thread(
+            target=self._camera_detector_loop,
+            daemon=True
+        )
+        self._detector_thread.start()
+        self.get_logger().info("Camera detector started.")
+
+    def stop_camera_detector(self):
+        """
+        TODO:
+        - Gracefully stop camera detector thread and release resources.
+        - Call this from shutdown to close camera.
+        """
+        self._detector_running = False
+        if self._detector_thread is not None:
+            try:
+                self._detector_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self.get_logger().info("Camera detector stopped (TODO: ensure camera released).")
+
+    def _camera_detector_loop(self):
+        """
+        Continuously runs in background:
+        - reads camera frames
+        - calls detect_human(frame)
+        - triggers the detection handler (on_human_detected)
+        """
+        cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            self.get_logger().error("Camera not available. Detector disabled.")
+            return
+
+        while self._detector_running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+
+            # ---- PLACEHOLDER: HUMAN DETECTION GOES HERE ----
+            # detect_human must return (detected: bool, confidence: float)
+            detected, confidence = self.detect_human(frame)
+            # ------------------------------------------------
+
+            if detected:
+                with self._human_lock:
+                    if not self.human_detected:
+                        self.human_detected = True
+                        self.get_logger().warn(
+                            f"HUMAN DETECTED (conf={confidence:.2f})"
+                        )
+                        # Route detection through a single handler so logic is centralized.
+                        # on_human_detected currently mirrors old behavior for compatibility,
+                        # but you should modify it later to use flight_state state machine.
+                        try:
+                            self.on_human_detected(confidence)
+                        except Exception as e:
+                            self.get_logger().error(f"on_human_detected handler failed: {e}")
+
+            time.sleep(0.05)
+
+        try:
+            cap.release()
+        except Exception:
+            pass
+        self.get_logger().info("Camera detector loop terminated.")
+
+    def detect_human(self, frame):
+        """
+        PLACEHOLDER for offline human detection.
+
+        Replace later with:
+        - MobileNet-SSD
+        - YOLO
+        - OpenCV HOG
+        - custom model
+
+        Must return:
+            (detected: bool, confidence: float)
+
+        TODOs:
+          - Load model weights once (not per-frame)
+          - Run inference on 'frame' and return detection result
+          - Keep this function fast and avoid blocking long operations
+          - Ensure it runs offline (no internet)
+        """
+        # TODO: implement offline human detection
+        return False, 0.0
+
+    # ---------------------------
+    # Detection event handler (centralized)
+    # ---------------------------
+    def on_human_detected(self, confidence=None):
+        """
+        Central handler called once when a human is detected.
+
+        CURRENT BEHAVIOR (backwards-compatible):
+          - sets self.stop_requested = True (exact same effect as pressing 'q')
+
+        FUTURE PLAN (TODO):
+          - Instead of stop_requested, set self.flight_state = "HUMAN_DETECTED"
+          - Do NOT execute long-running or flight commands here
+          - Spawn threads or let mission loop handle motion/state transitions
+
+        TODOs:
+          - Replace stop_requested assignment with state transition when ready
+          - Add logging of detection metadata (time, confidence, position)
+          - Add debounce/cooldown logic to avoid repeated triggers
+        """
+        try:
+            # Quick legacy behavior to preserve existing mission logic:
+            # This makes the detection behave exactly like pressing 'q' today.
+            self.get_logger().info("on_human_detected: setting stop_requested (legacy behaviour).")
+            self.stop_requested = True
+
+            # TODO: Replace legacy behaviour with state machine:
+            # Example:
+            # if self.flight_state == "MISSION":
+            #     self.flight_state = "HUMAN_DETECTED"
+            #     self.original_altitude = self.get_current_global_position(timeout=1.0)[2]  # optional
+            #     self.delivery_start_time = time.time()
+
+        except Exception as e:
+            self.get_logger().error(f"Error in on_human_detected: {e}")
+
+    # ---------------------------
     # Mission runner (background)
     # ---------------------------
     def load_and_run_mission(self):
@@ -450,7 +578,7 @@ class GridSurveyNode(Node):
         """
         if self.kml_file:
             self.polygon_coords = self.parse_kml_coordinates(self.kml_file)
-            
+
         if not self.polygon_coords:
              self.get_logger().error("No polygon coordinates available. Cannot generate grid.")
              return
@@ -463,16 +591,14 @@ class GridSurveyNode(Node):
 
         self.get_logger().info(f"Generated {len(grid)} waypoints.")
 
-
         # switch to GUIDED
         self.set_mode("GUIDED")
 
         # arm
         self.arm()
-        
+
         # Set speed
         self.set_speed(self.speed)
-
 
         # (Optional) read one position message before takeoff
         try:
@@ -507,6 +633,8 @@ class GridSurveyNode(Node):
 
         # iterate waypoints
         for idx, (lat, lon) in enumerate(grid):
+            # NOTE: Existing mission logic checks stop_requested. In future you will replace this
+            # with flight_state checks. See on_human_detected() TODOs.
             if self.stop_requested:
                 self.get_logger().info("Stop requested; aborting waypoint loop.")
                 return
@@ -521,7 +649,7 @@ class GridSurveyNode(Node):
             while time.time() - start < self.waypoint_timeout_s and not self.stop_requested:
                 # Resend command periodically (1Hz) to prevent timeout and handle packet loss
                 self.send_guided_position(lat, lon, self.altitude)
-                
+
                 cur = self.get_current_global_position(timeout=1.0)
                 if cur is None:
                     self.get_logger().debug("No position message received while waiting.")
@@ -539,13 +667,9 @@ class GridSurveyNode(Node):
                         f"Waypoint {idx+1} reached (d={d:.1f} m)."
                     )
                     break
-                    
+
                 # We reuse the get_current_global_position timeout as partial sleep, 
                 # but better to have explicit rate control if that returns fast.
-                # get_current_global_position blocks up to 1s.
-                # If it returns fast, we might flood. Let's sleep a bit if needed.
-                # But actually, sending at 10Hz is fine too. 
-                # Let's just rely on the fact the loop takes some time.
                 time.sleep(0.5)
 
             if not reached:
@@ -555,6 +679,58 @@ class GridSurveyNode(Node):
 
         self.get_logger().info("All waypoints processed (or mission ended).")
 
+    # ---------------------------
+    # Delivery pipeline placeholders (structure only)
+    # ---------------------------
+    def enter_delivery_mode(self):
+        """
+        TODO:
+          - Pause mission progression (don't issue new waypoints)
+          - Ensure vehicle is in GUIDED (or appropriate) mode
+          - Record original altitude and position
+        """
+        pass
+
+    def descend_for_delivery(self):
+        """
+        TODO:
+          - Command controlled descent to self.delivery_altitude
+          - Include safety checks: GPS health, minimum altitude, obstacles, etc.
+        """
+        pass
+
+    def hold_for_drop(self):
+        """
+        TODO:
+          - Stabilize and hover for self.delivery_hover_time
+          - Verify position/accuracy before trigger
+        """
+        pass
+
+    def trigger_drop_node(self):
+        """
+        TODO:
+          - Notify the payload-release node or send appropriate MAVLink/servo command
+          - This function should NOT block; it should publish/command and return
+        """
+        pass
+
+    def ascend_after_drop(self):
+        """
+        TODO:
+          - Command climb back to mission altitude or safe altitude
+          - Update any state variables for resume
+        """
+        pass
+
+    def resume_mission(self):
+        """
+        TODO:
+          - Restore mission state and continue waypoints (if desired)
+          - Or choose to RTL/LOITER based on mission policy
+        """
+        pass
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -563,35 +739,17 @@ def main(args=None):
     parser.add_argument('--kml', type=str, default='demo_survey_area_new.kml', help='Path to KML file')
     parser.add_argument('--connect', type=str, default='udp:127.0.0.1:14551', help='MAVLink connection string')
     parser.add_argument('--speed', type=float, default=5.0, help='Drone speed in m/s')
-    
+
     # We need to parse args but rclpy also uses args.
-    # Let's filter out ROS2 args or just use sys.argv carefully? 
     # rclpy.init handles ROS args. We will use argparse for the rest.
-    # Using parse_known_args is safer.
     parsed, unknown = parser.parse_known_args()
 
     node = GridSurveyNode()
-    
+
     # Configure node
     node.set_kml_file(parsed.kml)
     node.speed = parsed.speed
-    
-    # Re-connect if connection string is different?
-    # The node currently connects in __init__ with hardcoded.
-    # We should update that to use the argument.
-    # Since we can't easily change __init__ signature without bigger refactor,
-    # let's just close and reopen or warn if different.
-    # Actually, let's fix the __init__ usage in a better way: 
-    # we can't easily pass args to __init__ because we already instantiated it.
-    # For now, let's warn that hardcoded connection is used unless we modify __init__ (which we didn't do above).
-    # Wait, I should have modified __init__ to accept the connection string.
-    # I'll rely on the default for now or I can do a quick monkey-patch if needed, 
-    # BUT for production readiness, I should have updated __init__.
-    # For this task, I will leave the connection hardcoded or update it if I can via tool.
-    # Given the replace blocks, I didn't change __init__ connection logic. 
-    # I'll just note this limitation or better, I will Close the old master and open new one if needed.
-    # Or cleaner: Since I didn't change __init__, I will assume default local connection is fine for the user's test.
-    
+
     node.get_logger().info(f"Using KML: {node.kml_file}")
     node.get_logger().info(f"Target Speed: {node.speed} m/s")
 
@@ -604,6 +762,11 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("KeyboardInterrupt detected in main; exiting.")
     finally:
+        # Ensure detector stopped on shutdown
+        try:
+            node.stop_camera_detector()
+        except Exception:
+            pass
         node.destroy_node()
         try:
             rclpy.shutdown()
@@ -615,11 +778,8 @@ if __name__ == '__main__':
     main()
 
 
-
-
-
 '''
-Bugs:
+Bugs / Notes (unchanged):
 
 1. No waypoint control speed is set; vehicle may move too fast or too slow between waypoints.
 2. No handling of vehicle disconnection or loss of MAVLink link.
