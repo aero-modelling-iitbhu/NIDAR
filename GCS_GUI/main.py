@@ -1,18 +1,14 @@
 import sys
 import os
 from PyQt6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QGridLayout,
-    QLabel
+    QApplication, QMainWindow, QWidget, 
+    QGridLayout, QLabel, QGraphicsDropShadowEffect
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 
-from widgets import VideoWidget, WebWidget, QGCLauncherWidget
-
+# Ensure widgets.py is in the same directory
+from widgets import VideoWidget, WebWidget, QGCLauncherWidget, TelemetryHubWidget
 
 class GCSMainWindow(QMainWindow):
     def __init__(self):
@@ -21,120 +17,79 @@ class GCSMainWindow(QMainWindow):
         self.setWindowTitle("ResQWings | Ground Control Station")
         self.resize(1280, 800)
 
-        # ================= CENTRAL WIDGET =================
+        # Main Container
         central_widget = QWidget()
+        central_widget.setObjectName("GridOverlay")
         self.setCentralWidget(central_widget)
 
         layout = QGridLayout()
-        layout.setContentsMargins(16, 12, 16, 16)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
         central_widget.setLayout(layout)
 
-        # ================= LOGO (TOP LEFT, WITH GLOW) =================
-        logo_label = QLabel()
-        logo_label.setStyleSheet("background: transparent; border: none;")
-
-        logo_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "assets",
-            "NidarLogo.png"
-        )
-
-        logo_pixmap = QPixmap(logo_path)
-        logo_label.setPixmap(
-            logo_pixmap.scaled(
-                100, 200,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-        )
-
-        # ---- Glow effect so BLACK logo is visible ----
+        # ================= LOGO (TOP LEFT) =================
+        self.logo_label = QLabel()
+        logo_path = os.path.join(os.path.dirname(__file__), "assets", "NidarLogo.png")
+        
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path).scaled(120, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.logo_label.setPixmap(pixmap)
+        
+        # White Glow Effect for Black Logo Visibility
         glow = QGraphicsDropShadowEffect()
-        glow.setBlurRadius(18)
+        glow.setBlurRadius(20)
         glow.setColor(Qt.GlobalColor.white)
         glow.setOffset(0, 0)
-        logo_label.setGraphicsEffect(glow)
+        self.logo_label.setGraphicsEffect(glow)
+        
+        layout.addWidget(self.logo_label, 0, 0, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        # Add logo at top-left
-        layout.addWidget(logo_label, 0, 0, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        # ================= TEAM NAME (CENTER, TEXT ONLY) =================
-        team_name = QLabel("ResQWings")
+        # ================= TEAM NAME (CENTER) =================
+        team_name = QLabel("RESQWINGS COMMAND")
         team_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        team_name.setStyleSheet("""
-            background: transparent;
-            border: none;
-            font-size: 32px;
-            font-weight: 800;
-            letter-spacing: 2px;
-            color: #e0f7ff;
-        """)
-
+        team_name.setStyleSheet("font-size: 30px; font-weight: 800; letter-spacing: 3px; color: #38bdf8;")
         layout.addWidget(team_name, 0, 0, 1, 3)
 
-        # ================= COMPONENTS =================
-        qgc_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "QGroundControl.AppImage"
-        )
+        # ================= INITIALIZE WIDGETS =================
+        qgc_path = os.path.join(os.path.dirname(__file__), "QGroundControl.AppImage")
         self.qgc_widget = QGCLauncherWidget(app_path=qgc_path)
+        
+        self.rpi_drone1 = WebWidget(url="https://www.raspberrypi.com/", title="RPi CONNECT - DRONE 1")
+        self.rpi_drone2 = WebWidget(url="https://www.raspberrypi.com/", title="RPi CONNECT - DRONE 2")
+        self.cam_feed = VideoWidget(source=0, title="LIVE OPTICAL FEED - DRONE 1")
+        
+        # Survivor Telemetry Hub (Persistent Tracking)
+        self.telemetry_hub = TelemetryHubWidget()
 
-        self.rpi_connect_drone_2 = WebWidget(
-            url="https://www.raspberrypi.com/software/connect/",
-            title="RPi Connect - Drone 2"
-        )
-
-        self.rpi_connect_drone_1 = WebWidget(
-            url="https://www.raspberrypi.com/software/connect/",
-            title="RPi Connect - Drone 1"
-        )
-
-        self.camera_drone_1 = VideoWidget(
-            source=0,
-            title="Camera Stream - Drone 1"
-        )
-
-        self.camera_drone_2 = VideoWidget(
-            source=1,
-            title="Camera Stream - Drone 2"
-        )
-
-        # ================= GRID =================
+        # ================= GRID LAYOUT =================
+        # Row 1: QGC (Spans 2 columns) | RPi Drone 2
         layout.addWidget(self.qgc_widget, 1, 0, 1, 2)
-        layout.addWidget(self.rpi_connect_drone_2, 1, 2)
+        layout.addWidget(self.rpi_drone2, 1, 2)
+        
+        # Row 2: RPi Drone 1 | Camera Feed | Telemetry Tracking
+        layout.addWidget(self.rpi_drone1, 2, 0)
+        layout.addWidget(self.cam_feed, 2, 1)
+        layout.addWidget(self.telemetry_hub, 2, 2)
 
-        layout.addWidget(self.rpi_connect_drone_1, 2, 0)
-        layout.addWidget(self.camera_drone_1, 2, 1)
-        layout.addWidget(self.camera_drone_2, 2, 2)
-
-        # ================= STRETCH =================
+        # Stretch Factors
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(2, 1)
-
-        layout.setRowStretch(0, 0)
         layout.setRowStretch(1, 2)
         layout.setRowStretch(2, 1)
-
 
 def main():
     app = QApplication(sys.argv)
 
-    style_file = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "style.qss"
-    )
-    if os.path.exists(style_file):
-        with open(style_file, "r") as f:
+    # Load External CSS
+    css_path = os.path.join(os.path.dirname(__file__), "style.css") # Ensure your css file is named style.css
+    if os.path.exists(css_path):
+        with open(css_path, "r") as f:
             app.setStyleSheet(f.read())
 
     window = GCSMainWindow()
     window.show()
-
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
