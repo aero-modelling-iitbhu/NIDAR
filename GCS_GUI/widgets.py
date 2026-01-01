@@ -1,24 +1,24 @@
 import cv2
-import sys
 import os
 import subprocess
 import time
-from PyQt6.QtWidgets import (QWidget, QLabel, QVBoxLayout, QPushButton, 
-                             QFrame, QSizePolicy, QMessageBox)
+import csv
+from PyQt6.QtWidgets import (
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, 
+    QPushButton, QTableWidget, QTableWidgetItem, 
+    QHeaderView, QTabWidget, QFrame
+)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(QImage)
-
     def __init__(self, source=0):
         super().__init__()
         self.source = source
         self._run_flag = True
-
     def run(self):
-        # capture from web cam
         cap = cv2.VideoCapture(self.source)
         while self._run_flag:
             ret, cv_img = cap.read()
@@ -26,189 +26,178 @@ class VideoThread(QThread):
                 rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
-                convert_to_qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                p = convert_to_qt_format.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio)
-                self.change_pixmap_signal.emit(p)
+                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                self.change_pixmap_signal.emit(qt_img.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio))
             else:
-                # If no camera, sleep a bit to avoid busy loop
                 time.sleep(1)
-        # shut down capture system
         cap.release()
-
     def stop(self):
         self._run_flag = False
         self.wait()
 
-class VideoWidget(QWidget):
+class VideoWidget(QFrame):
     def __init__(self, source=0, title="Camera Stream"):
         super().__init__()
-        self.setWindowTitle(title)
-        self.disply_width = 640
-        self.display_height = 480
-        
+        layout = QVBoxLayout()
         self.title_label = QLabel(title)
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet("font-weight: bold; color: white; background-color: #333; padding: 5px;")
-
-        self.image_label = QLabel(self)
-        self.image_label.resize(self.disply_width, self.display_height)
-        self.image_label.setStyleSheet("background-color: black;")
+        self.title_label.setStyleSheet("font-weight: bold; color: #38bdf8; background-color: rgba(56, 189, 248, 0.1); padding: 5px;")
+        
+        self.image_label = QLabel("INITIALIZING FEED...")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setText("No Signal")
-
-        layout = QVBoxLayout()
+        self.image_label.setStyleSheet("background-color: black; border-radius: 5px;")
+        
         layout.addWidget(self.title_label)
         layout.addWidget(self.image_label)
-        layout.setContentsMargins(0,0,0,0)
         self.setLayout(layout)
-
-        self.source = source
+        
         self.thread = VideoThread(source)
-        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.change_pixmap_signal.connect(lambda img: self.image_label.setPixmap(QPixmap.fromImage(img)))
         self.thread.start()
 
-    def update_image(self, qt_img):
-        self.image_label.setPixmap(QPixmap.fromImage(qt_img))
-
-    def closeEvent(self, event):
-        self.thread.stop()
-        event.accept()
-
-class WebWidget(QWidget):
+class WebWidget(QFrame):
     def __init__(self, url="https://google.com", title="Web View"):
         super().__init__()
-        
+        layout = QVBoxLayout()
         self.title_label = QLabel(title)
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet("font-weight: bold; color: white; background-color: #333; padding: 5px;")
-
+        self.title_label.setStyleSheet("font-weight: bold; color: #38bdf8; background-color: rgba(56, 189, 248, 0.1); padding: 5px;")
+        
         self.browser = QWebEngineView()
         self.browser.setUrl(QUrl(url))
-
-        layout = QVBoxLayout()
+        
         layout.addWidget(self.title_label)
         layout.addWidget(self.browser)
-        layout.setContentsMargins(0,0,0,0)
         self.setLayout(layout)
 
-class QGCLauncherWidget(QWidget):
+class TelemetryHubWidget(QFrame):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout()
+        
+        # --- Header with Counter ---
+        header_layout = QHBoxLayout()
+        self.title_label = QLabel("LIVE SURVIVOR TRACKING")
+        self.title_label.setStyleSheet("font-weight: bold; color: #10b981; font-size: 14px;")
+        
+        self.counter_label = QLabel("TOTAL FOUND: 0")
+        self.counter_label.setStyleSheet("""
+            background-color: #059669; 
+            color: white; 
+            font-weight: 800; 
+            padding: 2px 10px; 
+            border-radius: 5px;
+            border: 1px solid #34d399;
+        """)
+        
+        header_layout.addWidget(self.title_label)
+        header_layout.addStretch()
+        header_layout.addWidget(self.counter_label)
+
+        self.tabs = QTabWidget()
+        self.drone1_table = self.create_table()
+        self.drone2_table = self.create_table()
+        
+        self.tabs.addTab(self.drone1_table, "DRONE 1")
+        self.tabs.addTab(self.drone2_table, "DRONE 2")
+
+        layout.addLayout(header_layout)
+        layout.addWidget(self.tabs)
+        self.setLayout(layout)
+
+        self.drone1_cache = {}
+        self.drone2_cache = {}
+        self.total_detected_count = 0
+        self.counted_locations = set() 
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_data)
+        self.timer.start(1000)
+
+    def create_table(self):
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["COUNT", "LOCATION", "STATUS"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        return table
+
+    def refresh_data(self):
+        self.process_csv("drone1_telemetry.csv", self.drone1_table, self.drone1_cache)
+        self.process_csv("drone2_telemetry.csv", self.drone2_table, self.drone2_cache)
+        self.counter_label.setText(f"TOTAL FOUND: {self.total_detected_count}")
+
+    def process_csv(self, filename, table, cache):
+        if not os.path.exists(filename): return
+        try:
+            with open(filename, 'r') as f:
+                reader = list(csv.reader(f))
+                if len(reader) > 1:
+                    for row in reader[1:]:
+                        if len(row) < 3: continue
+                        count_val, loc, raw_status = row[0], row[1], row[2]
+                        status_text = raw_status.strip().lower()
+
+                        # --- FILTER LOGIC ---
+                        # Skip if it is just "Searching"
+                        if "searching" in status_text:
+                            continue 
+                        
+                        # Only proceed if status is Detected or Delivered
+                        if "detected" in status_text or "delivered" in status_text:
+                            # Update Counter only for NEW detections
+                            if loc not in self.counted_locations and "detected" in status_text:
+                                try:
+                                    self.total_detected_count += int(count_val)
+                                    self.counted_locations.add(loc)
+                                except ValueError:
+                                    pass
+
+                            # Add to cache (This keeps the record on screen)
+                            cache[loc] = [count_val, raw_status]
+
+            # Update the UI table from the filtered cache
+            table.setRowCount(len(cache))
+            for i, (loc, info) in enumerate(cache.items()):
+                table.setItem(i, 0, QTableWidgetItem(info[0]))
+                table.setItem(i, 1, QTableWidgetItem(loc))
+                
+                status_item = QTableWidgetItem(info[1])
+                curr_status = info[1].strip().lower()
+                
+                if "delivered" in curr_status:
+                    status_item.setBackground(Qt.GlobalColor.green)
+                    status_item.setForeground(Qt.GlobalColor.black)
+                elif "detected" in curr_status:
+                    status_item.setBackground(Qt.GlobalColor.red)
+                    status_item.setForeground(Qt.GlobalColor.white)
+                
+                table.setItem(i, 2, status_item)
+        except: pass
+
+class QGCLauncherWidget(QFrame):
     def __init__(self, app_path="./QGroundControl.AppImage"):
         super().__init__()
         self.app_path = app_path
-        self.process = None
-        self.embedded_window = None
-
-        self.title_label = QLabel("QGroundControl")
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet("font-weight: bold; color: white; background-color: #222; font-size: 16px;")
-
-        self.status_label = QLabel("Ready to Launch")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet("color: #aaa;")
-
-        self.launch_btn = QPushButton("Launch QGroundControl")
-        self.launch_btn.clicked.connect(self.launch_qgc)
-        self.launch_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50; 
-                color: white; 
-                padding: 10px; 
-                border-radius: 5px;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-
         self.layout = QVBoxLayout()
+        
+        self.status_label = QLabel("QGROUNDCONTROL SYSTEM")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.btn = QPushButton("LAUNCH MISSION CONTROL")
+        self.btn.clicked.connect(self.launch)
+        
         self.layout.addStretch()
-        self.layout.addWidget(self.title_label)
         self.layout.addWidget(self.status_label)
-        self.layout.addWidget(self.launch_btn)
+        self.layout.addWidget(self.btn)
         self.layout.addStretch()
-        self.layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self.layout)
-        self.setStyleSheet("background-color: #1e1e1e;")
 
-    def launch_qgc(self):
-        # Resolve absolute path
-        if not os.path.exists(self.app_path):
-             if os.path.exists(os.path.join(os.getcwd(), "QGroundControl.AppImage")):
-                 self.app_path = os.path.join(os.getcwd(), "QGroundControl.AppImage")
-             elif os.path.exists(os.path.join(os.path.dirname(__file__), "QGroundControl.AppImage")):
-                 self.app_path = os.path.join(os.path.dirname(__file__), "QGroundControl.AppImage")
-             else:
-                 self.status_label.setText(f"Error: Not found at {self.app_path}")
-                 return
-
-        try:
-            os.chmod(self.app_path, 0o755)
-            self.process = subprocess.Popen([self.app_path])
-            self.status_label.setText("Launching... Please wait.")
-            self.launch_btn.setEnabled(False)
-            
-            # Start checking for the window
-            QTimer.singleShot(2000, self.check_for_window)
-        except Exception as e:
-            self.status_label.setText(f"Failed: {str(e)}")
-            self.launch_btn.setEnabled(True)
-
-    def check_for_window(self):
-        wid = self.find_qgc_wid()
-        if wid:
-            self.embed_window(wid)
-        else:
-            # Keep checking for up to 30 seconds
-            QTimer.singleShot(1000, self.check_for_window)
-
-    def find_qgc_wid(self):
-        try:
-            print("DEBUG: Checking for QGC window...")
-            # querying xwininfo tree
-            output = subprocess.check_output(['xwininfo', '-root', '-tree']).decode('utf-8', errors='ignore')
-            for line in output.splitlines():
-                # Flexible matching
-                low_line = line.lower()
-                if "qgroundcontrol" in low_line:
-                    print(f"DEBUG: Found candidate line: {line.strip()}")
-                    # Line format usually: "  0x4400001 "QGroundControl": ..."
-                    parts = line.strip().split()
-                    if parts:
-                        wid_str = parts[0]
-                        if wid_str.startswith('0x'):
-                            # Verify if it really looks like a window id
-                            try:
-                                wid = int(wid_str, 16)
-                                print(f"DEBUG: Returning WID: {hex(wid)}")
-                                return wid
-                            except ValueError:
-                                continue
-        except Exception as e:
-            print(f"DEBUG: Error finding window: {e}")
-        return None
-
-    def embed_window(self, wid):
-        try:
-            from PyQt6.QtGui import QWindow
-            
-            window = QWindow.fromWinId(wid)
-            self.embedded_window = QWidget.createWindowContainer(window)
-            
-            # Remove placeholder widgets
-            self.title_label.hide()
-            self.status_label.hide()
-            self.launch_btn.hide()
-            
-            # Add embedded window
-            self.layout.addWidget(self.embedded_window)
-            self.layout.setStretch(0, 0) # Reset stretches
-            self.layout.setStretch(1, 1) # Make sure embedded window expands
-            
-            self.status_label.setText("Embedded")
-            print(f"Embedded window {hex(wid)}")
-        except Exception as e:
-            self.status_label.setText(f"Embedding failed: {e}")
-            self.title_label.show()
-            self.status_label.show()
-
+    def launch(self):
+        if os.path.exists(self.app_path):
+            subprocess.Popen([self.app_path])
+            self.btn.setEnabled(False)
+            self.status_label.setText("SYSTEM ACTIVE")
