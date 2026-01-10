@@ -10,14 +10,15 @@ BROKER_ADDRESS = "broker.hivemq.com"
 BROKER_PORT = 1883
 TOPIC = "nidar/drone/survey/locations"
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         print("Connected to MQTT Broker!")
         if userdata == "receiver":
             client.subscribe(TOPIC)
             print(f"Subscribed to {TOPIC}")
     else:
-        print(f"Failed to connect, return code {rc}")
+        print(f"Failed to connect, reason code {reason_code}")
+
 
 def on_message(client, userdata, msg):
     try:
