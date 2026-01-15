@@ -131,7 +131,7 @@ class GridSurveyNode:
         # mission parameters
         self.altitude = 15.0               # meters
         self.spacing = 0.00010             # degrees approx (lat)
-        self.speed = 5.0                   # m/s
+        self.speed = 3.0                   # m/s
         self.kml_file = None
         self.polygon_coords = []           # list of (lat, lon)
 
